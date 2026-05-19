@@ -1,4 +1,4 @@
-// backend/routes/payRuns.js — Fixed: LOP, loan per-month, auto-refresh, Cloudinary
+// backend/routes/payRuns.js — Fixed: LOP, loan EMI, recalculate
 const express = require('express');
 const { body, validationResult } = require('express-validator');
 const { db } = require('../config/database');
@@ -6,7 +6,6 @@ const { authenticate, authorize } = require('../middleware/auth');
 const router = express.Router();
 router.use(authenticate);
 
-// GET /api/pay-runs
 router.get('/', async (req, res, next) => {
   try {
     const { page = 1, limit = 20, status } = req.query;
@@ -26,7 +25,6 @@ router.get('/', async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
-// GET /api/pay-runs/:id
 router.get('/:id', async (req, res, next) => {
   try {
     const run = await db.one('SELECT * FROM pay_runs WHERE id=$1 AND org_id=$2', [req.params.id, req.orgId]);
@@ -44,20 +42,148 @@ router.get('/:id', async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
-// Helper: count working days in a month (Mon-Fri)
-function countWorkingDays(startDate, endDate) {
-  let count = 0;
-  const cur = new Date(startDate);
-  const end = new Date(endDate);
-  while (cur <= end) {
-    const day = cur.getDay();
-    if (day !== 0 && day !== 6) count++;
-    cur.setDate(cur.getDate() + 1);
+// Core payroll calculation function
+async function calculatePayroll(client, orgId, periodStart, periodEnd, currency) {
+  const employees = await client.query(
+    `SELECT * FROM employees WHERE org_id=$1 AND is_active=TRUE AND status NOT IN ('terminated')`,
+    [orgId]
+  );
+
+  const items = [];
+  let totalGross = 0, totalNet = 0, totalDed = 0;
+
+  for (const emp of employees.rows) {
+    // Working days in period
+    const start = new Date(periodStart);
+    const end = new Date(periodEnd);
+    const totalDays = Math.ceil((end - start) / (1000*60*60*24)) + 1;
+
+    // Check for unpaid leave / LOP in this period
+    const lopResult = await client.query(`
+      SELECT COALESCE(SUM(
+        -- Days of unpaid leave that fall within the pay period
+        LEAST(lr.to_date::date, $3::date) - GREATEST(lr.from_date::date, $2::date) + 1
+      ), 0) AS lop_days
+      FROM leave_requests lr
+      JOIN leave_policies lp ON lp.id = lr.policy_id
+      WHERE lr.employee_id = $1
+        AND lr.status = 'approved'
+        AND lp.is_paid = false
+        AND lr.from_date <= $3
+        AND lr.to_date >= $2
+    `, [emp.id, periodStart, periodEnd]);
+    const lopDays = parseFloat(lopResult.rows[0]?.lop_days || 0);
+
+    // Get salary components
+    const comps = await client.query(`
+      SELECT ess.*, sc.name, sc.code, sc.type, sc.calculation, sc.percentage as comp_pct
+      FROM employee_salary_structures ess
+      JOIN salary_components sc ON sc.id=ess.component_id
+      WHERE ess.employee_id=$1 AND ess.is_active=TRUE
+    `, [emp.id]);
+
+    let earnings = 0, dedFromComps = 0;
+    const componentDetails = [];
+
+    const baseSalary = parseFloat(emp.base_salary);
+
+    if (comps.rows.length > 0) {
+      for (const c of comps.rows) {
+        let amount = parseFloat(c.amount || 0);
+        if (c.calculation === 'percentage_of_basic') {
+          amount = (baseSalary * parseFloat(c.percentage || c.comp_pct || 0)) / 100;
+        }
+        // Apply LOP deduction proportionally to each earning component
+        if ((c.type === 'earning' || c.type === 'benefit') && lopDays > 0) {
+          const lopDeductionForComp = (amount / totalDays) * lopDays;
+          amount = Math.max(amount - lopDeductionForComp, 0);
+        }
+        componentDetails.push({ name: c.name, code: c.code, type: c.type, amount: parseFloat(amount.toFixed(2)) });
+        if (c.type === 'earning' || c.type === 'benefit') earnings += amount;
+        else if (c.type === 'deduction') dedFromComps += amount;
+      }
+    } else {
+      earnings = baseSalary;
+    }
+
+    // Apply LOP to base salary if no components
+    let lopAmount = 0;
+    if (comps.rows.length === 0 && lopDays > 0) {
+      lopAmount = (baseSalary / totalDays) * lopDays;
+      earnings = Math.max(earnings - lopAmount, 0);
+    } else if (lopDays > 0) {
+      // LOP already applied per component above, just track it
+      lopAmount = (baseSalary / totalDays) * lopDays;
+    }
+
+    // Add LOP as a deduction line item if applicable
+    if (lopDays > 0) {
+      componentDetails.push({
+        name: `Loss of Pay (${lopDays} days)`,
+        code: 'LOP',
+        type: 'deduction',
+        amount: parseFloat(lopAmount.toFixed(2))
+      });
+    }
+
+    const grossSalary = baseSalary;
+
+    // ── LOAN: deduct only the current period's EMI installment ──────────────
+    const loanDedResult = await client.query(`
+      SELECT COALESCE(SUM(lr.amount), 0) AS total
+      FROM loan_repayments lr
+      JOIN loans l ON l.id = lr.loan_id
+      WHERE l.employee_id = $1
+        AND l.status = 'active'
+        AND lr.is_paid = FALSE
+        AND lr.due_date >= $2::date
+        AND lr.due_date <= $3::date
+    `, [emp.id, periodStart, periodEnd]);
+    const loanDeduction = parseFloat(loanDedResult.rows[0]?.total || 0);
+
+    // ── ADVANCE: recover monthly portion ────────────────────────────────────
+    const advDedResult = await client.query(`
+      SELECT COALESCE(SUM(
+        CASE WHEN recovery_months > 0 
+          THEN LEAST(amount / recovery_months, amount - recovered_amount)
+          ELSE 0 
+        END
+      ), 0) AS total
+      FROM salary_advances
+      WHERE employee_id = $1 
+        AND status = 'approved' 
+        AND recovered_amount < amount
+    `, [emp.id]);
+    const advanceDeduction = parseFloat(advDedResult.rows[0]?.total || 0);
+
+    const totalDeductions = dedFromComps + loanDeduction + advanceDeduction;
+    const netSalary = Math.max(earnings - dedFromComps - loanDeduction - advanceDeduction, 0);
+
+    totalGross += grossSalary;
+    totalNet += netSalary;
+    totalDed += totalDeductions;
+
+    items.push({
+      employee_id: emp.id,
+      gross_salary: grossSalary.toFixed(2),
+      total_earnings: earnings.toFixed(2),
+      total_deductions: totalDeductions.toFixed(2),
+      loan_deduction: loanDeduction.toFixed(2),
+      advance_deduction: advanceDeduction.toFixed(2),
+      lop_days: lopDays,
+      lop_amount: lopAmount.toFixed(2),
+      net_salary: netSalary.toFixed(2),
+      currency,
+      components: JSON.stringify(componentDetails),
+      working_days: totalDays,
+      paid_days: totalDays - lopDays,
+    });
   }
-  return count || 1;
+
+  return { items, totalGross, totalNet, totalDed, count: employees.rows.length };
 }
 
-// POST /api/pay-runs — Create with LOP + correct loan deduction
+// POST /api/pay-runs — Create
 router.post('/',
   authorize('super_admin','admin','hr_manager','accountant'),
   [body('period_start').isISO8601(), body('period_end').isISO8601(), body('pay_date').isISO8601()],
@@ -68,184 +194,77 @@ router.post('/',
 
       const { period_start, period_end, pay_date, currency = 'AED', notes } = req.body;
 
-      // Check for existing non-cancelled run in same period
-      const existing = await db.one(`
-        SELECT id, status FROM pay_runs
-        WHERE org_id=$1 AND status NOT IN ('cancelled')
-          AND period_start <= $2 AND period_end >= $3
-      `, [req.orgId, period_end, period_start]);
-
-      if (existing) {
-        // If draft/approved — recalculate it instead of blocking
-        if (['draft','approved'].includes(existing.status)) {
-          // Delete old items and recalculate
-          await db.query('DELETE FROM pay_run_items WHERE pay_run_id=$1', [existing.id]);
-          await recalcPayRun(existing.id, req.orgId, period_start, period_end, currency, req.user.id);
-          const updated = await db.one('SELECT * FROM pay_runs WHERE id=$1', [existing.id]);
-          return res.json({ success: true, data: updated, message: 'Pay run recalculated' });
-        }
-        return res.status(409).json({ success: false, message: `A ${existing.status} pay run already exists for this period. Cancel it first.` });
-      }
-
       const result = await db.transaction(async (client) => {
         const runRow = await client.query(`
           INSERT INTO pay_runs (org_id,period_start,period_end,pay_date,currency,status,notes,created_by)
           VALUES ($1,$2,$3,$4,$5,'draft',$6,$7) RETURNING *
         `, [req.orgId, period_start, period_end, pay_date, currency, notes, req.user.id]);
         const payRun = runRow.rows[0];
-        await recalcPayRunClient(client, payRun.id, req.orgId, period_start, period_end, currency);
-        return db.one('SELECT * FROM pay_runs WHERE id=$1', [payRun.id]);
-      });
 
+        const { items, totalGross, totalNet, totalDed, count } = await calculatePayroll(client, req.orgId, period_start, period_end, currency);
+
+        for (const item of items) {
+          await client.query(`
+            INSERT INTO pay_run_items (
+              pay_run_id, employee_id, gross_salary, total_earnings,
+              total_deductions, loan_deduction, advance_deduction, net_salary,
+              currency, components, working_days, paid_days
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+          `, [payRun.id, item.employee_id, item.gross_salary, item.total_earnings,
+              item.total_deductions, item.loan_deduction, item.advance_deduction,
+              item.net_salary, item.currency, item.components,
+              item.working_days, item.paid_days]);
+        }
+
+        await client.query(`
+          UPDATE pay_runs SET total_gross=$1,total_net=$2,total_deductions=$3,employee_count=$4 WHERE id=$5
+        `, [totalGross.toFixed(2), totalNet.toFixed(2), totalDed.toFixed(2), count, payRun.id]);
+
+        return { ...payRun, total_gross: totalGross, total_net: totalNet, employee_count: count };
+      });
       res.status(201).json({ success: true, data: result, message: 'Pay run created' });
     } catch (err) { next(err); }
   }
 );
 
-// POST /api/pay-runs/:id/recalculate — refresh existing pay run
+// POST /api/pay-runs/:id/recalculate — refresh existing draft pay run
 router.post('/:id/recalculate', authorize('super_admin','admin','hr_manager','accountant'), async (req, res, next) => {
   try {
     const run = await db.one('SELECT * FROM pay_runs WHERE id=$1 AND org_id=$2', [req.params.id, req.orgId]);
     if (!run) return res.status(404).json({ success: false, message: 'Not found' });
-    if (run.status === 'paid') return res.status(400).json({ success: false, message: 'Cannot recalculate a paid run' });
+    if (!['draft'].includes(run.status)) return res.status(400).json({ success: false, message: 'Can only recalculate draft pay runs' });
 
-    await db.query('DELETE FROM pay_run_items WHERE pay_run_id=$1', [req.params.id]);
-    await recalcPayRun(run.id, req.orgId, run.period_start, run.period_end, run.currency, req.user.id);
+    await db.transaction(async (client) => {
+      // Delete existing items
+      await client.query('DELETE FROM pay_run_items WHERE pay_run_id=$1', [req.params.id]);
+
+      const { items, totalGross, totalNet, totalDed, count } = await calculatePayroll(
+        client, req.orgId, run.period_start, run.period_end, run.currency
+      );
+
+      for (const item of items) {
+        await client.query(`
+          INSERT INTO pay_run_items (
+            pay_run_id, employee_id, gross_salary, total_earnings,
+            total_deductions, loan_deduction, advance_deduction, net_salary,
+            currency, components, working_days, paid_days
+          ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+        `, [req.params.id, item.employee_id, item.gross_salary, item.total_earnings,
+            item.total_deductions, item.loan_deduction, item.advance_deduction,
+            item.net_salary, item.currency, item.components,
+            item.working_days, item.paid_days]);
+      }
+
+      await client.query(`
+        UPDATE pay_runs SET total_gross=$1,total_net=$2,total_deductions=$3,employee_count=$4,updated_at=NOW() WHERE id=$5
+      `, [totalGross.toFixed(2), totalNet.toFixed(2), totalDed.toFixed(2), count, req.params.id]);
+    });
+
     const updated = await db.one('SELECT * FROM pay_runs WHERE id=$1', [req.params.id]);
     res.json({ success: true, data: updated, message: 'Pay run recalculated successfully' });
   } catch (err) { next(err); }
 });
 
-// Core calculation function (uses pool directly)
-async function recalcPayRun(runId, orgId, period_start, period_end, currency, userId) {
-  return db.transaction(async (client) => {
-    await recalcPayRunClient(client, runId, orgId, period_start, period_end, currency);
-  });
-}
-
-async function recalcPayRunClient(client, runId, orgId, period_start, period_end, currency) {
-  // Get all active employees
-  const employees = await client.query(
-    `SELECT * FROM employees WHERE org_id=$1 AND is_active=TRUE AND status IN ('active','on_leave')`,
-    [orgId]
-  );
-
-  const totalWorkingDays = countWorkingDays(period_start, period_end);
-  let totalGross = 0, totalNet = 0, totalDed = 0;
-
-  for (const emp of employees.rows) {
-    // ── 1. Salary components ─────────────────────────────────────────────────
-    const comps = await client.query(`
-      SELECT ess.*, sc.name, sc.code, sc.type, sc.calculation, sc.percentage as comp_pct
-      FROM employee_salary_structures ess
-      JOIN salary_components sc ON sc.id=ess.component_id
-      WHERE ess.employee_id=$1 AND ess.is_active=TRUE
-    `, [emp.id]);
-
-    let earnings = 0, deductions = 0;
-    const componentDetails = [];
-
-    if (comps.rows.length > 0) {
-      for (const c of comps.rows) {
-        let amount = parseFloat(c.amount);
-        if (c.calculation === 'percentage_of_basic') {
-          amount = (parseFloat(emp.base_salary) * parseFloat(c.percentage || c.comp_pct || 0)) / 100;
-        }
-        componentDetails.push({ name: c.name, code: c.code, type: c.type, amount: amount.toFixed(2) });
-        if (c.type === 'earning' || c.type === 'benefit') earnings += amount;
-        else if (c.type === 'deduction') deductions += amount;
-      }
-    } else {
-      earnings = parseFloat(emp.base_salary);
-    }
-
-    const grossSalary = parseFloat(emp.base_salary);
-
-    // ── 2. LOP (Loss of Pay) — count unpaid approved leaves in period ────────
-    const lopResult = await client.query(`
-      SELECT COALESCE(SUM(lr.days), 0) AS lop_days
-      FROM leave_requests lr
-      JOIN leave_policies lp ON lp.id = lr.policy_id
-      WHERE lr.employee_id = $1
-        AND lr.status = 'approved'
-        AND lp.is_paid = FALSE
-        AND lr.from_date <= $2
-        AND lr.to_date >= $3
-    `, [emp.id, period_end, period_start]);
-
-    const lopDays = parseFloat(lopResult.rows[0]?.lop_days || 0);
-    const dailyRate = grossSalary / totalWorkingDays;
-    const lopDeduction = lopDays > 0 ? Math.min(lopDays * dailyRate, earnings) : 0;
-
-    if (lopDays > 0) {
-      componentDetails.push({
-        name: `LOP (${lopDays} day${lopDays > 1 ? 's' : ''})`,
-        code: 'LOP',
-        type: 'deduction',
-        amount: lopDeduction.toFixed(2)
-      });
-      deductions += lopDeduction;
-      earnings = Math.max(earnings - lopDeduction, 0);
-    }
-
-    // ── 3. Loan deduction — ONLY the current month's EMI installment ─────────
-    // Find the ONE installment due in this pay period (not all unpaid ones)
-    const loanInstallment = await client.query(`
-      SELECT COALESCE(SUM(lr.amount), 0) AS emi
-      FROM loan_repayments lr
-      JOIN loans l ON l.id = lr.loan_id
-      WHERE l.employee_id = $1
-        AND l.status = 'active'
-        AND lr.is_paid = FALSE
-        AND lr.due_date >= $2
-        AND lr.due_date <= $3
-    `, [emp.id, period_start, period_end]);
-    const loanDeduction = parseFloat(loanInstallment.rows[0]?.emi || 0);
-
-    // ── 4. Advance deduction — monthly recovery amount ───────────────────────
-    const advResult = await client.query(`
-      SELECT COALESCE(SUM(
-        ROUND((amount / GREATEST(recovery_months, 1))::numeric, 2)
-      ), 0) AS monthly_recovery
-      FROM salary_advances
-      WHERE employee_id = $1
-        AND status = 'approved'
-        AND recovered_amount < amount
-    `, [emp.id]);
-    const advanceDeduction = parseFloat(advResult.rows[0]?.monthly_recovery || 0);
-
-    // ── 5. Calculate net ──────────────────────────────────────────────────────
-    const totalDeductions = deductions + loanDeduction + advanceDeduction;
-    const netSalary = Math.max(earnings - loanDeduction - advanceDeduction, 0);
-
-    totalGross += grossSalary;
-    totalNet += netSalary;
-    totalDed += totalDeductions;
-
-    await client.query(`
-      INSERT INTO pay_run_items (
-        pay_run_id, employee_id, gross_salary, total_earnings,
-        total_deductions, loan_deduction, advance_deduction, net_salary,
-        currency, components, working_days, leave_days
-      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
-    `, [
-      runId, emp.id, grossSalary, earnings.toFixed(2),
-      totalDeductions.toFixed(2), loanDeduction.toFixed(2),
-      advanceDeduction.toFixed(2), netSalary.toFixed(2),
-      currency, JSON.stringify(componentDetails),
-      totalWorkingDays, lopDays,
-    ]);
-  }
-
-  // Update totals
-  await client.query(`
-    UPDATE pay_runs
-    SET total_gross=$1, total_net=$2, total_deductions=$3, employee_count=$4
-    WHERE id=$5
-  `, [totalGross.toFixed(2), totalNet.toFixed(2), totalDed.toFixed(2), employees.rows.length, runId]);
-}
-
-// POST /api/pay-runs/:id/approve
 router.post('/:id/approve', authorize('super_admin','admin'), async (req, res, next) => {
   try {
     const run = await db.one('SELECT * FROM pay_runs WHERE id=$1 AND org_id=$2', [req.params.id, req.orgId]);
@@ -256,7 +275,6 @@ router.post('/:id/approve', authorize('super_admin','admin'), async (req, res, n
   } catch (err) { next(err); }
 });
 
-// POST /api/pay-runs/:id/mark-paid
 router.post('/:id/mark-paid', authorize('super_admin','admin','accountant'), async (req, res, next) => {
   try {
     const run = await db.one('SELECT * FROM pay_runs WHERE id=$1 AND org_id=$2', [req.params.id, req.orgId]);
@@ -267,43 +285,44 @@ router.post('/:id/mark-paid', authorize('super_admin','admin','accountant'), asy
       await client.query(`UPDATE pay_runs SET status='paid',paid_by=$1,paid_at=NOW() WHERE id=$2`, [req.user.id, req.params.id]);
       await client.query(`UPDATE pay_run_items SET is_processed=TRUE WHERE pay_run_id=$1`, [req.params.id]);
 
-      const items = await client.query('SELECT id,employee_id FROM pay_run_items WHERE pay_run_id=$1', [req.params.id]);
+      const items = await client.query('SELECT * FROM pay_run_items WHERE pay_run_id=$1', [req.params.id]);
+
       for (const item of items.rows) {
+        // Create payslip
         await client.query(`INSERT INTO payslips (pay_run_item_id,employee_id) VALUES ($1,$2) ON CONFLICT DO NOTHING`, [item.id, item.employee_id]);
-      }
 
-      // Mark only this period's loan installments as paid
-      const itemsDetail = await client.query(`
-        SELECT pri.employee_id, pri.loan_deduction, pri.advance_deduction
-        FROM pay_run_items pri WHERE pri.pay_run_id=$1
-      `, [req.params.id]);
-
-      for (const item of itemsDetail.rows) {
+        // Mark specific loan installments as paid (only the ones due in this period)
         if (parseFloat(item.loan_deduction) > 0) {
-          // Mark ONLY the installments due in this period as paid
           await client.query(`
             UPDATE loan_repayments SET is_paid=TRUE, paid_date=NOW(), paid_amount=amount
             WHERE loan_id IN (SELECT id FROM loans WHERE employee_id=$1 AND status='active')
               AND is_paid=FALSE
-              AND due_date >= $2 AND due_date <= $3
+              AND due_date >= $2::date
+              AND due_date <= $3::date
           `, [item.employee_id, run.period_start, run.period_end]);
 
-          // Close loan if all installments paid
+          // Check if all installments paid → close loan
           await client.query(`
             UPDATE loans SET status='closed'
             WHERE employee_id=$1 AND status='active'
               AND id NOT IN (
-                SELECT loan_id FROM loan_repayments WHERE is_paid=FALSE
+                SELECT DISTINCT loan_id FROM loan_repayments WHERE is_paid=FALSE
               )
           `, [item.employee_id]);
         }
 
+        // Recover advance — only the monthly portion
         if (parseFloat(item.advance_deduction) > 0) {
           await client.query(`
             UPDATE salary_advances
-            SET recovered_amount = LEAST(recovered_amount + (amount/GREATEST(recovery_months,1)), amount)
+            SET recovered_amount = LEAST(
+              recovered_amount + (amount / GREATEST(recovery_months, 1)),
+              amount
+            )
             WHERE employee_id=$1 AND status='approved' AND recovered_amount < amount
           `, [item.employee_id]);
+
+          // Mark fully recovered advances
           await client.query(`
             UPDATE salary_advances SET status='recovered'
             WHERE employee_id=$1 AND status='approved' AND recovered_amount >= amount
@@ -311,11 +330,10 @@ router.post('/:id/mark-paid', authorize('super_admin','admin','accountant'), asy
         }
       }
     });
-    res.json({ success: true, message: 'Pay run marked paid, payslips generated' });
+    res.json({ success: true, message: 'Pay run marked paid' });
   } catch (err) { next(err); }
 });
 
-// DELETE /api/pay-runs/:id
 router.delete('/:id', authorize('super_admin','admin'), async (req, res, next) => {
   try {
     const run = await db.one('SELECT status FROM pay_runs WHERE id=$1 AND org_id=$2', [req.params.id, req.orgId]);

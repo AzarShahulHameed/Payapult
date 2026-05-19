@@ -74,3 +74,18 @@ async function migrate() {
   }
 }
 migrate();
+
+// Add LOP columns to pay_run_items
+async function migrateLOP() {
+  const { Pool } = require('pg');
+  const pool = process.env.DATABASE_URL
+    ? new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } })
+    : new Pool({ host: process.env.DB_HOST, port: process.env.DB_PORT, database: process.env.DB_NAME, user: process.env.DB_USER, password: process.env.DB_PASSWORD });
+  const client = await pool.connect();
+  try {
+    await client.query('ALTER TABLE pay_run_items ADD COLUMN IF NOT EXISTS lop_days NUMERIC(5,1) DEFAULT 0');
+    await client.query('ALTER TABLE pay_run_items ADD COLUMN IF NOT EXISTS lop_amount NUMERIC(15,2) DEFAULT 0');
+    console.log('✅ LOP columns added to pay_run_items');
+  } finally { client.release(); await pool.end(); }
+}
+migrateLOP().catch(console.error);

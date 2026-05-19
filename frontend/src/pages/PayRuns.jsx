@@ -74,15 +74,17 @@ export default function PayRuns() {
         <Card style={{ padding: 0, overflow: 'hidden' }}>
           <div style={{ padding: '16px 20px', fontWeight: 700, color: C.navy, fontSize: 14 }}>Employee Breakdown</div>
           <Table
-            headers={['Employee', 'Dept', 'Gross', 'Deductions', 'Loan', 'Advance', 'Net']}
+            headers={['Employee', 'Dept', 'Gross', 'LOP Days', 'Loan EMI', 'Advance', 'Net']}
             rows={sel.items}
             renderRow={r => (<>
               <Td style={{ fontWeight: 600 }}>{r.emp_name}</Td>
               <Td style={{ color: C.textMuted }}>{r.dept_name}</Td>
               <Td>{r.currency} {fmt(r.gross_salary)}</Td>
-              <Td style={{ color: C.danger }}>-{fmt(r.total_deductions)}</Td>
-              <Td style={{ color: C.warning }}>-{fmt(r.loan_deduction)}</Td>
-              <Td style={{ color: C.warning }}>-{fmt(r.advance_deduction)}</Td>
+              <Td style={{ color: parseFloat(r.lop_days||0)>0 ? C.danger : C.textMuted }}>
+                {parseFloat(r.lop_days||0)>0 ? `${r.lop_days}d (-${fmt(r.lop_amount)})` : '—'}
+              </Td>
+              <Td style={{ color: C.warning }}>{parseFloat(r.loan_deduction||0)>0 ? `-${fmt(r.loan_deduction)}` : '—'}</Td>
+              <Td style={{ color: C.warning }}>{parseFloat(r.advance_deduction||0)>0 ? `-${fmt(r.advance_deduction)}` : '—'}</Td>
               <Td style={{ fontWeight: 700, color: C.success }}>{r.currency} {fmt(r.net_salary)}</Td>
             </>)}
           />

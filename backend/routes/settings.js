@@ -378,3 +378,66 @@ router.post('/upload/employee-photo/:id/cloud', authorize('super_admin','admin',
     res.json({ success: true, url: photoUrl, data: emp });
   } catch (err) { next(err); }
 });
+
+// ── CLOUDINARY UPLOADS ────────────────────────────────────────────────────────
+const multerMemory = require('multer')({ storage: require('multer').memoryStorage(), limits: { fileSize: 5*1024*1024 } });
+
+router.post('/upload/logo', authorize('super_admin','admin'), multerMemory.single('logo'), async (req, res, next) => {
+  try {
+    if (!req.file) return res.status(400).json({ success: false, message: 'No file' });
+    let logoUrl;
+    if (process.env.CLOUDINARY_CLOUD_NAME) {
+      const { uploadToCloudinary } = require('../config/cloudinary');
+      const result = await uploadToCloudinary(req.file.buffer, 'payapult/logos', `org-${req.orgId}`);
+      logoUrl = result.secure_url;
+    } else {
+      const path = require('path'); const fs = require('fs');
+      const dir = './uploads/logos'; if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+      const fname = `${Date.now()}-${req.file.originalname.replace(/\s/g,'_')}`;
+      fs.writeFileSync(path.join(dir, fname), req.file.buffer);
+      logoUrl = `/uploads/logos/${fname}`;
+    }
+    const org = await db.one('UPDATE organizations SET logo_url=$1 WHERE id=$2 RETURNING *', [logoUrl, req.orgId]);
+    res.json({ success: true, url: logoUrl, data: org });
+  } catch (err) { next(err); }
+});
+
+router.post('/upload/avatar', multerMemory.single('avatar'), async (req, res, next) => {
+  try {
+    if (!req.file) return res.status(400).json({ success: false, message: 'No file' });
+    let avatarUrl;
+    if (process.env.CLOUDINARY_CLOUD_NAME) {
+      const { uploadToCloudinary } = require('../config/cloudinary');
+      const result = await uploadToCloudinary(req.file.buffer, 'payapult/avatars', `user-${req.user.id}`);
+      avatarUrl = result.secure_url;
+    } else {
+      const path = require('path'); const fs = require('fs');
+      const dir = './uploads/avatars'; if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+      const fname = `${Date.now()}-avatar`;
+      fs.writeFileSync(path.join(dir, fname), req.file.buffer);
+      avatarUrl = `/uploads/avatars/${fname}`;
+    }
+    const user = await db.one('UPDATE users SET avatar_url=$1 WHERE id=$2 RETURNING id,email,first_name,last_name,role,avatar_url,phone', [avatarUrl, req.user.id]);
+    res.json({ success: true, url: avatarUrl, user });
+  } catch (err) { next(err); }
+});
+
+router.post('/upload/employee-photo/:id', authorize('super_admin','admin','hr_manager'), multerMemory.single('photo'), async (req, res, next) => {
+  try {
+    if (!req.file) return res.status(400).json({ success: false, message: 'No file' });
+    let photoUrl;
+    if (process.env.CLOUDINARY_CLOUD_NAME) {
+      const { uploadToCloudinary } = require('../config/cloudinary');
+      const result = await uploadToCloudinary(req.file.buffer, 'payapult/employees', `emp-${req.params.id}`);
+      photoUrl = result.secure_url;
+    } else {
+      const path = require('path'); const fs = require('fs');
+      const dir = './uploads/avatars'; if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+      const fname = `${Date.now()}-photo`;
+      fs.writeFileSync(path.join(dir, fname), req.file.buffer);
+      photoUrl = `/uploads/avatars/${fname}`;
+    }
+    const emp = await db.one('UPDATE employees SET photo_url=$1 WHERE id=$2 AND org_id=$3 RETURNING id,photo_url', [photoUrl, req.params.id, req.orgId]);
+    res.json({ success: true, url: photoUrl, data: emp });
+  } catch (err) { next(err); }
+});

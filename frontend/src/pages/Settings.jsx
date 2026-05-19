@@ -7,7 +7,7 @@ import useStore from '../store/useStore';
 import toast from 'react-hot-toast';
 
 const btn = (v='primary') => ({
-  padding:'9px 20px',borderRadius:8,border:'none',cursor:'pointer',fontSize:13,fontWeight:600,
+  padding:'9px 20px',borderRadius:8,cursor:'pointer',fontSize:13,fontWeight:600,
   fontFamily:"'DM Sans',sans-serif",transition:'all 0.15s',
   background:v==='primary'?C.navy:v==='danger'?C.danger:v==='success'?C.success:C.offWhite,
   color:v==='secondary'?C.textPrimary:'#fff',

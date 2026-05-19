@@ -69,6 +69,7 @@ export const payRunsAPI = {
   markPaid: id => api.post(`/pay-runs/${id}/mark-paid`),
   recalculate: id => api.post(`/pay-runs/${id}/recalculate`),
   cancel: id => api.delete(`/pay-runs/${id}`),
+  recalculate: id => api.post(`/pay-runs/${id}/recalculate`),
 };
 export const leaveAPI = {
   list: p => api.get('/leave', { params: p }),
@@ -154,3 +155,6 @@ export const templatesAPI = {
   importData: (fd) => api.post('/documents/templates/import', fd, { headers: { 'Content-Type': 'multipart/form-data' } }),
   remove: (id) => api.delete(`/documents/templates/${id}`),
 };
+
+// Add recalculate to payRunsAPI
+// Usage: payRunsAPI.recalculate(id)
