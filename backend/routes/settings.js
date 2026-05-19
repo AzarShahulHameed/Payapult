@@ -303,3 +303,78 @@ router.post('/upload/employee-photo/:id', authorize('super_admin','admin','hr_ma
     res.json({ success: true, url: photoUrl, data: emp });
   } catch (err) { next(err); }
 });
+
+// ── CLOUDINARY UPLOAD OVERRIDE ────────────────────────────────────────────────
+// Replaces the multer-only endpoints with Cloudinary-backed versions
+const { uploadToCloudinary } = require('../config/cloudinary');
+const path2 = require('path');
+const fs2   = require('fs');
+
+// Override: POST /api/settings/upload/logo — with Cloudinary
+router.post('/upload/logo/cloud', authorize('super_admin','admin'), upload.single('logo'), async (req, res, next) => {
+  try {
+    if (!req.file) return res.status(400).json({ success: false, message: 'No file uploaded' });
+
+    let logoUrl = `/uploads/logos/${req.file.filename}`;
+
+    // Try Cloudinary first
+    try {
+      const cloudUrl = await uploadToCloudinary(req.file.path, 'payapult/logos');
+      if (cloudUrl) {
+        logoUrl = cloudUrl;
+        // Delete local file after successful cloud upload
+        if (fs2.existsSync(req.file.path)) fs2.unlinkSync(req.file.path);
+      }
+    } catch (cloudErr) {
+      // Fall back to local URL if Cloudinary fails
+      console.warn('Cloudinary upload failed, using local:', cloudErr.message);
+    }
+
+    const org = await db.one('UPDATE organizations SET logo_url=$1 WHERE id=$2 RETURNING *', [logoUrl, req.orgId]);
+    res.json({ success: true, url: logoUrl, data: org });
+  } catch (err) { next(err); }
+});
+
+// Override: POST /api/settings/upload/avatar/cloud — with Cloudinary
+router.post('/upload/avatar/cloud', upload.single('avatar'), async (req, res, next) => {
+  try {
+    if (!req.file) return res.status(400).json({ success: false, message: 'No file uploaded' });
+
+    let avatarUrl = `/uploads/avatars/${req.file.filename}`;
+
+    try {
+      const cloudUrl = await uploadToCloudinary(req.file.path, 'payapult/avatars');
+      if (cloudUrl) {
+        avatarUrl = cloudUrl;
+        if (fs2.existsSync(req.file.path)) fs2.unlinkSync(req.file.path);
+      }
+    } catch (cloudErr) {
+      console.warn('Cloudinary upload failed, using local:', cloudErr.message);
+    }
+
+    const user = await db.one('UPDATE users SET avatar_url=$1 WHERE id=$2 RETURNING id,email,first_name,last_name,role,avatar_url,phone', [avatarUrl, req.user.id]);
+    res.json({ success: true, url: avatarUrl, user });
+  } catch (err) { next(err); }
+});
+
+// Override: POST /api/settings/upload/employee-photo/:id/cloud — with Cloudinary
+router.post('/upload/employee-photo/:id/cloud', authorize('super_admin','admin','hr_manager'), upload.single('photo'), async (req, res, next) => {
+  try {
+    if (!req.file) return res.status(400).json({ success: false, message: 'No file uploaded' });
+
+    let photoUrl = `/uploads/avatars/${req.file.filename}`;
+
+    try {
+      const cloudUrl = await uploadToCloudinary(req.file.path, 'payapult/employees');
+      if (cloudUrl) {
+        photoUrl = cloudUrl;
+        if (fs2.existsSync(req.file.path)) fs2.unlinkSync(req.file.path);
+      }
+    } catch (cloudErr) {
+      console.warn('Cloudinary upload failed, using local:', cloudErr.message);
+    }
+
+    const emp = await db.one('UPDATE employees SET photo_url=$1 WHERE id=$2 AND org_id=$3 RETURNING id,photo_url', [photoUrl, req.params.id, req.orgId]);
+    res.json({ success: true, url: photoUrl, data: emp });
+  } catch (err) { next(err); }
+});

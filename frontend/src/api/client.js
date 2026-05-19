@@ -67,6 +67,7 @@ export const payRunsAPI = {
   create: d => api.post('/pay-runs', d),
   approve: id => api.post(`/pay-runs/${id}/approve`),
   markPaid: id => api.post(`/pay-runs/${id}/mark-paid`),
+  recalculate: id => api.post(`/pay-runs/${id}/recalculate`),
   cancel: id => api.delete(`/pay-runs/${id}`),
 };
 export const leaveAPI = {
@@ -128,11 +129,11 @@ export const settingsAPI = {
 export const uploadAPI = {
   logo: (file) => {
     const fd = new FormData(); fd.append('logo', file);
-    return api.post('/settings/upload/logo', fd, { headers: { 'Content-Type': 'multipart/form-data' } });
+    return api.post('/settings/upload/logo/cloud', fd, { headers: { 'Content-Type': 'multipart/form-data' } });
   },
   avatar: (file) => {
     const fd = new FormData(); fd.append('avatar', file);
-    return api.post('/settings/upload/avatar', fd, { headers: { 'Content-Type': 'multipart/form-data' } });
+    return api.post('/settings/upload/avatar/cloud', fd, { headers: { 'Content-Type': 'multipart/form-data' } });
   },
   employeePhoto: (empId, file) => {
     const fd = new FormData(); fd.append('photo', file);

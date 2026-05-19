@@ -3,6 +3,7 @@ const { Pool } = require('pg');
 const logger = require('./logger');
 
 const getConfig = () => {
+  // If DATABASE_URL is set, parse it manually
   if (process.env.DATABASE_URL) {
     const url = process.env.DATABASE_URL
       .replace('?pgbouncer=true', '')
@@ -16,6 +17,7 @@ const getConfig = () => {
     };
   }
 
+  // Use individual env vars (more reliable with Supabase pooler)
   return {
     host:     process.env.DB_HOST,
     port:     parseInt(process.env.DB_PORT) || 6543,
@@ -34,6 +36,7 @@ const pool = new Pool(getConfig());
 pool.on('connect', () => logger.info('✅ DB connected'));
 pool.on('error', (err) => logger.error('DB error:', err.message));
 
+// Test connection on startup
 pool.query('SELECT 1').then(() => logger.info('✅ Database connection verified')).catch(e => logger.error('❌ DB connection failed:', e.message));
 
 const db = {

@@ -36,6 +36,7 @@ export default function PayRuns() {
       if (action === 'approve') await payRunsAPI.approve(run.id);
       else if (action === 'paid') await payRunsAPI.markPaid(run.id);
       else if (action === 'cancel') await payRunsAPI.cancel(run.id);
+      else if (action === 'recalculate') { await payRunsAPI.recalculate(run.id); toast.success('Pay run recalculated with latest data!'); }
       toast.success(`Pay run ${action === 'paid' ? 'marked as paid' : action + 'd'}!`);
       fetchRuns();
       setSel(null);
@@ -65,6 +66,7 @@ export default function PayRuns() {
         <div style={{ display: 'flex', gap: 10 }}>
           {sel.status === 'draft' && <Btn variant="success" onClick={() => handleAction(sel, 'approve')}>Approve</Btn>}
           {['draft','approved'].includes(sel.status) && <Btn onClick={() => handleAction(sel, 'paid')}>Mark as Paid</Btn>}
+          {['draft','approved'].includes(sel.status) && <Btn variant="secondary" onClick={() => handleAction(sel, 'recalculate')}>🔄 Recalculate</Btn>}
           {sel.status !== 'paid' && <Btn variant="danger" onClick={() => handleAction(sel, 'cancel')}>Cancel Run</Btn>}
         </div>
       </Card>

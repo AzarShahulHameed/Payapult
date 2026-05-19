@@ -99,7 +99,7 @@ export default function Employees() {
     setPhotoUploading(true);
     try {
       const fd = new FormData(); fd.append('photo', file);
-      const r = await api.post(`/settings/upload/employee-photo/${empId}`, fd, { headers:{'Content-Type':'multipart/form-data'} });
+      const r = await api.post(`/settings/upload/employee-photo/${empId}/cloud`, fd, { headers:{'Content-Type':'multipart/form-data'} });
       toast.success('Photo updated!');
       if (sel) setSel(s => ({ ...s, photo_url: r.data.url }));
       fetchEmployees();
